@@ -1,0 +1,66 @@
+{
+  "crawler_stats": {
+    "processed": 1,
+    "failed": 4,
+    "in_queue": 0,
+    "blocked_by_robots": 0,
+    "rate_limited_times": 0,
+    "avg_response_time": 0.123,
+    "requests_per_second": 0.16,
+    "elapsed": 6.16,
+    "robots": {
+      "domains_cached": 2,
+      "loaded": 2
+    },
+    "blocked_by_circuit": 1,
+    "retry": {
+      "attempts": 8,
+      "successes": 1,
+      "failures": 3,
+      "retries": 4,
+      "by_error_type": {
+        "PermanentError": 1,
+        "TransientError": 6
+      },
+      "permanent_urls": [
+        [
+          "https://httpbin.org/status/404",
+          "404 Not Found: https://httpbin.org/status/404"
+        ]
+      ],
+      "total_retry_time": 3.4550448370387032
+    },
+    "circuit": {
+      "domains_with_failures": 1,
+      "domains_open": 1,
+      "failures": {
+        "httpbin.org": 3
+      },
+      "open_until": {
+        "httpbin.org": 9.99
+      }
+    }
+  },
+  "failed_urls": {
+    "https://httpbin.org/status/404": "PermanentError: 404 Not Found: https://httpbin.org/status/404",
+    "https://httpbin.org/status/500": "All retries failed: 500 Server Error: https://httpbin.org/status/500",
+    "https://httpbin.org/status/503": "All retries failed: 503 Server Error: https://httpbin.org/status/503",
+    "https://httpbin.org/status/429": "circuit breaker open"
+  },
+  "permanent_urls": [
+    [
+      "https://httpbin.org/status/404",
+      "404 Not Found: https://httpbin.org/status/404"
+    ]
+  ],
+  "circuit_stats": {
+    "domains_with_failures": 1,
+    "domains_open": 1,
+    "failures": {
+      "httpbin.org": 3
+    },
+    "open_until": {
+      "httpbin.org": 9.99
+    }
+  }
+}

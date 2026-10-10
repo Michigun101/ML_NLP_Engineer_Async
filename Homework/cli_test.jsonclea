@@ -1,0 +1,17 @@
+{
+  "total_pages": 1,
+  "successful": 1,
+  "failed": 0,
+  "elapsed_seconds": 1.98,
+  "avg_rps": 0.5,
+  "status_codes": {
+    "200": 1
+  },
+  "top_domains": [
+    [
+      "httpbin.org",
+      1
+    ]
+  ],
+  "error_types": {}
+}

@@ -1,0 +1,30 @@
+{
+  "total_pages": 6,
+  "successful": 4,
+  "failed": 2,
+  "elapsed_seconds": 0.0,
+  "avg_rps": 41323.19,
+  "status_codes": {
+    "200": 4,
+    "404": 1,
+    "500": 1
+  },
+  "top_domains": [
+    [
+      "python.org",
+      3
+    ],
+    [
+      "google.com",
+      2
+    ],
+    [
+      "example.com",
+      1
+    ]
+  ],
+  "error_types": {
+    "PermanentError": 1,
+    "TransientError": 1
+  }
+}

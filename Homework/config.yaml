@@ -1,0 +1,35 @@
+# Crawler configuration
+start_urls:
+  - https://www.python.org
+  - https://httpbin.org/html
+
+max_pages: 10
+max_depth: 0
+max_concurrent: 5
+requests_per_second: 2.0
+respect_robots: true
+user_agent: "Day7Bot/1.0"
+
+max_retries: 2
+backoff_factor: 2.0
+circuit_threshold: 3
+circuit_timeout: 10.0
+
+same_domain_only: false
+
+exclude_patterns:
+  - /jobs/
+  - /downloads/
+
+include_patterns: []
+
+storage:
+  type: json
+  path: crawl_results_day7.jsonl
+
+output:
+  json: report_day7.json
+  html: report_day7.html
+
+log_file: crawler_day7.log
+log_level: INFO

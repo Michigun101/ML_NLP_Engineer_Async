@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Crawler Report</title>
+    <style>
+        body {
+            font-family: -apple-system, Segoe UI, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+            color: #333;
+        }
+        h1 { border-bottom: 2px solid #0066cc; padding-bottom: 10px; }
+        h2 { color: #0066cc; margin-top: 30px; }
+        .summary {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .card {
+            background: #f5f7fa;
+            padding: 15px 25px;
+            border-radius: 8px;
+            min-width: 150px;
+        }
+        .card .num {
+            font-size: 2em;
+            font-weight: bold;
+            color: #0066cc;
+        }
+        .card .label { color: #666; font-size: 0.9em; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px 12px;
+            border-bottom: 1px solid #ddd;
+        }
+        th { background: #f5f7fa; }
+        .timestamp { color: #888; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <h1> Crawler Report</h1>
+    <p class="timestamp">Сгенерировано: 2026-10-10 15:22:57</p>
+
+    <h2> Общая статистика</h2>
+    <div class="summary">
+        <div class="card">
+            <div class="num">2</div>
+            <div class="label">Всего страниц</div>
+        </div>
+        <div class="card">
+            <div class="num" style="color: #28a745;">2</div>
+            <div class="label">Успешных</div>
+        </div>
+        <div class="card">
+            <div class="num" style="color: #dc3545;">0</div>
+            <div class="label">Упавших</div>
+        </div>
+        <div class="card">
+            <div class="num">5.67s</div>
+            <div class="label">Время работы</div>
+        </div>
+        <div class="card">
+            <div class="num">0.35</div>
+            <div class="label">Страниц/сек</div>
+        </div>
+    </div>
+
+    <h2> HTTP-коды</h2>
+    <table>
+        <tr><th>Код</th><th>Количество</th></tr>
+        <tr><td>200</td><td>2</td></tr>
+    </table>
+
+    <h2> Топ доменов</h2>
+    <table>
+        <tr><th>Домен</th><th>Страниц</th></tr>
+        <tr><td>www.python.org</td><td>1</td></tr><tr><td>httpbin.org</td><td>1</td></tr>
+    </table>
+
+    <h2> Типы ошибок</h2>
+    <table>
+        <tr><th>Тип</th><th>Количество</th></tr>
+        <tr><td colspan='2'>Нет ошибок 🎉</td></tr>
+    </table>
+</body>
+</html>
