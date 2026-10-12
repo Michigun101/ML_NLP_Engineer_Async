@@ -4,63 +4,60 @@
     "failed": 4,
     "in_queue": 0,
     "blocked_by_robots": 0,
-    "rate_limited_times": 0,
-    "avg_response_time": 0.123,
-    "requests_per_second": 0.16,
-    "elapsed": 6.16,
+    "rate_limiter": {
+      "requests_per_second": 2.0,
+      "burst": 1,
+      "per_domain": true,
+      "keys_tracked": 2,
+      "acquired": 5,
+      "times_waited": 3,
+      "avg_wait": 0.4948
+    },
+    "avg_response_time": 0.109,
+    "requests_per_second": 0.03,
+    "elapsed": 35.34,
     "robots": {
       "domains_cached": 2,
-      "loaded": 2
+      "loaded": 1
     },
-    "blocked_by_circuit": 1,
+    "blocked_by_circuit": 0,
     "retry": {
-      "attempts": 8,
+      "attempts": 13,
       "successes": 1,
-      "failures": 3,
-      "retries": 4,
+      "failures": 4,
+      "retries": 8,
       "by_error_type": {
-        "PermanentError": 1,
-        "TransientError": 6
+        "NetworkError": 12
       },
-      "permanent_urls": [
-        [
-          "https://httpbin.org/status/404",
-          "404 Not Found: https://httpbin.org/status/404"
-        ]
-      ],
-      "total_retry_time": 3.4550448370387032
+      "permanent_urls": [],
+      "total_retry_time": 25.315513427896338
     },
     "circuit": {
       "domains_with_failures": 1,
       "domains_open": 1,
       "failures": {
-        "httpbin.org": 3
+        "httpstat.us": 4
       },
       "open_until": {
-        "httpbin.org": 9.99
+        "httpstat.us": 4.53
       }
     }
   },
   "failed_urls": {
-    "https://httpbin.org/status/404": "PermanentError: 404 Not Found: https://httpbin.org/status/404",
-    "https://httpbin.org/status/500": "All retries failed: 500 Server Error: https://httpbin.org/status/500",
-    "https://httpbin.org/status/503": "All retries failed: 503 Server Error: https://httpbin.org/status/503",
-    "https://httpbin.org/status/429": "circuit breaker open"
+    "https://httpstat.us/404": "All retries failed: Network: https://httpstat.us/404 — Server disconnected",
+    "https://httpstat.us/500": "All retries failed: Network: https://httpstat.us/500 — Server disconnected",
+    "https://httpstat.us/429": "All retries failed: Network: https://httpstat.us/429 — Server disconnected",
+    "https://httpstat.us/503": "All retries failed: Network: https://httpstat.us/503 — Server disconnected"
   },
-  "permanent_urls": [
-    [
-      "https://httpbin.org/status/404",
-      "404 Not Found: https://httpbin.org/status/404"
-    ]
-  ],
+  "permanent_urls": [],
   "circuit_stats": {
     "domains_with_failures": 1,
     "domains_open": 1,
     "failures": {
-      "httpbin.org": 3
+      "httpstat.us": 4
     },
     "open_until": {
-      "httpbin.org": 9.99
+      "httpstat.us": 4.53
     }
   }
 }

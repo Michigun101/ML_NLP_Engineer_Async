@@ -2,8 +2,8 @@
   "total_pages": 2,
   "successful": 2,
   "failed": 0,
-  "elapsed_seconds": 5.67,
-  "avg_rps": 0.35,
+  "elapsed_seconds": 8.81,
+  "avg_rps": 0.23,
   "status_codes": {
     "200": 2
   },

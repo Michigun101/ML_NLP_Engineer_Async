@@ -398,6 +398,8 @@ class FinalCrawler(StoringCrawler):
             backoff_factor=config["backoff_factor"],
             circuit_threshold=config["circuit_threshold"],
             circuit_timeout=config["circuit_timeout"],
+            min_delay=config["min_delay"],   
+            jitter=config["jitter"],         
         )
 
         self.config = config
@@ -857,6 +859,28 @@ async def test_performance():
     except ImportError:
         print("   requests не установлен — пропускаем")    
 
+async def test_config_delay():
+    print()
+    print("ТЕСТ: min_delay/jitter из конфига")
+
+    config = CrawlerConfig.from_dict({
+        "start_urls": ["https://example.com"],
+        "min_delay": 0.3,
+        "jitter": 0.1,
+        "respect_robots": False,
+    })
+
+    storage = _create_storage(config["storage"])
+    crawler = FinalCrawler(config=config, storage=storage)
+
+    print(f"  crawler.min_delay = {crawler.min_delay}")
+    print(f"  crawler.jitter    = {crawler.jitter}")
+    assert crawler.min_delay == 0.3, f"min_delay не пробросился: {crawler.min_delay}"
+    assert crawler.jitter == 0.1, f"jitter не пробросился: {crawler.jitter}"
+
+    await crawler.close()
+    print(" Параметры доходят из конфига")
+
 async def main():
     setup_logging("crawler_day7.log", "INFO")
 
@@ -866,6 +890,7 @@ async def main():
     await test_config()
     await test_final_crawler()
     await test_performance()
+    await test_config_delay()
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
   "successful": 4,
   "failed": 2,
   "elapsed_seconds": 0.0,
-  "avg_rps": 41323.19,
+  "avg_rps": 29059.84,
   "status_codes": {
     "200": 4,
     "404": 1,

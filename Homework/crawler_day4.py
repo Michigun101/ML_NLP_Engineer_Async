@@ -42,36 +42,109 @@ def normalize_url(url: str) -> str: # https://python.org и https://python.org/ 
         return normalized.geturl()
 
 class RateLimiter:
-    """Ограничение скорости запросов"""
-
-    def __init__(self, requests_per_second: float = 1.0, per_domain: bool = True):
+    """Token bucket rate limiter"""
+    def __init__(
+        self,
+        requests_per_second: float = 1.0,
+        burst: int = 1,
+        per_domain: bool = True,
+    ):
         if requests_per_second <= 0:
             raise ValueError("requests_per_second должен быть > 0")
+        if not isinstance(burst, int) or burst < 1:
+            raise ValueError("burst должен быть целым >= 1")
 
-        self.requests_per_second = requests_per_second
-        self.min_interval = 1.0 / requests_per_second
+        self.requests_per_second = float(requests_per_second)
+        self.burst = burst
         self.per_domain = per_domain
 
-        # храним domain - время последнего запроса
-        self._last_request: dict[str, float] = {}
+        # key -> [tokens, last_update]
+        self._buckets: dict[str, list[float]] = {}
 
-    async def acquire(self, domain: str = None):
-        """Ожидание разрешения на запрос"""
+        # key -> Lock
+        self._locks: dict[str, asyncio.Lock] = {}
+
+        # Статистика
+        self._waits: list[float] = []     
+        self._acquired = 0                
+
+    def _key(self, domain: str | None) -> str:
         if self.per_domain:
-            key = domain or "__default__"
-        else:
-            key = "__global__"
+            return domain or "__default__"
+        return "__global__"
 
-        now = time.time()
-        last = self._last_request.get(key, 0.0)
-        elapsed = now - last
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
-        if elapsed < self.min_interval:
-            wait = self.min_interval - elapsed
-            logger.debug(f"  Rate limit: ждём {wait} сек для {key}")
-            await asyncio.sleep(wait)
+    def _get_bucket(self, key: str, now: float) -> list[float]:
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            # стартуем с полным ведром — разрешаем burst на старте
+            bucket = [float(self.burst), now]
+            self._buckets[key] = bucket
+        return bucket
 
-        self._last_request[key] = time.time()
+    async def acquire(self, domain: str | None = None) -> float:
+        """
+        Дождаться разрешения на запрос.
+        Возвращает, сколько секунд реально пришлось ждать (0.0 если сразу).
+        """
+        key = self._key(domain)
+        lock = self._get_lock(key)
+
+        async with lock:
+            total_wait = 0.0
+
+            while True:
+                now = time.time()
+                bucket = self._get_bucket(key, now)
+                tokens, last_update = bucket
+
+                # Пополняем ведро
+                elapsed = now - last_update
+                tokens = min(
+                    float(self.burst),
+                    tokens + elapsed * self.requests_per_second,
+                )
+                bucket[0] = tokens
+                bucket[1] = now
+
+                if tokens >= 1.0:
+                    # Токен есть — забираем
+                    bucket[0] = tokens - 1.0
+                    self._acquired += 1
+                    if total_wait > 0:
+                        self._waits.append(total_wait)
+                    return total_wait
+
+                # Токена нет — считаем, сколько ждать до 1.0
+                deficit = 1.0 - tokens
+                wait = deficit / self.requests_per_second
+
+                logger.debug(
+                    "  Token bucket: ждём %.3f сек для %s (токенов %.3f)",
+                    wait, key, tokens,
+                )
+
+                await asyncio.sleep(wait)
+                total_wait += wait
+
+    def stats(self) -> dict:
+        """Статистика по лимитеру."""
+        avg_wait = sum(self._waits) / len(self._waits) if self._waits else 0.0
+        return {
+            "requests_per_second": self.requests_per_second,
+            "burst": self.burst,
+            "per_domain": self.per_domain,
+            "keys_tracked": len(self._buckets),
+            "acquired": self._acquired,
+            "times_waited": len(self._waits),
+            "avg_wait": round(avg_wait, 4),
+        }
 
 if __name__ == "__main__":
     async def test_rate_limiter():
@@ -115,37 +188,52 @@ class RobotsParser:
         self.crawler = crawler
         self.user_agent = user_agent
         self._cache: dict[str, dict] = {}
+        self._lock = asyncio.Lock()
 
     async def fetch_robots(self, base_url: str) -> dict:
-        """загрузка robots.txt"""
+        """Загрузка robots.txt"""
         parsed = urlparse(base_url)
         domain = parsed.netloc
         scheme = parsed.scheme or "https"
 
+        # Быстрая проверка без lock 
         if domain in self._cache:
             return self._cache[domain]
 
-        robots_url = f"{scheme}://{domain}/robots.txt"
+        async with self._lock:
+            # Повторная проверка внутри lock — другой воркер мог уже загрузить
+            if domain in self._cache:
+                return self._cache[domain]
 
-        rules = {
-            "domain": domain,
-            "disallow": [],
-            "allow": [],
-            "crawl_delay": 0.0,
-            "loaded": False,
-        }
+            robots_url = f"{scheme}://{domain}/robots.txt"
 
-        text = await self.crawler.fetch_url(robots_url)
+            rules = {
+                "domain": domain,
+                "disallow": [],
+                "allow": [],
+                "crawl_delay": 0.0,
+                "loaded": False,
+            }
 
-        if text:
-            rules = self._parse(text, domain)
-            rules["loaded"] = True
-            logger.info(f" Загружен robots.txt: {domain}")
-        else:
-            logger.info(f" robots.txt не найден: {domain} (всё разрешено)")
+            try:
+                text = await self.crawler.fetch_url(robots_url)
+            except Exception as e:
+                logger.info(
+                    f" robots.txt недоступен: {domain} "
+                    f"({type(e).__name__}) — всё разрешено"
+                )
+                self._cache[domain] = rules
+                return rules
 
-        self._cache[domain] = rules
-        return rules
+            if text:
+                rules = self._parse(text, domain)
+                rules["loaded"] = True
+                logger.info(f" Загружен robots.txt: {domain}")
+            else:
+                logger.info(f" robots.txt пуст: {domain} (всё разрешено)")
+
+            self._cache[domain] = rules
+            return rules
 
     def _parse(self, text: str, domain: str) -> dict:
         """Распарсить содержимое robots.txt."""
@@ -248,7 +336,6 @@ class RobotsParser:
             "loaded": sum(1 for r in self._cache.values() if r["loaded"]),
         }
 
-
 class PoliteCrawler(AdvancedCrawler):
     """Краулер, соблюдающий правила вежливости"""
 
@@ -260,6 +347,7 @@ class PoliteCrawler(AdvancedCrawler):
         max_concurrent: int = 10,
         max_depth: int = 2,
         requests_per_second: float = 1.0,
+        burst: int = 1,
         per_domain_limit: bool = True,
         respect_robots: bool = True,
         min_delay: float = 0.0,
@@ -275,6 +363,7 @@ class PoliteCrawler(AdvancedCrawler):
 
         self.rate_limiter = RateLimiter(
             requests_per_second=requests_per_second,
+            burst=burst,
             per_domain=per_domain_limit,
         )
 
@@ -348,9 +437,8 @@ class PoliteCrawler(AdvancedCrawler):
                 logger.debug(f" Crawl-delay={robots_delay} для {domain}")
                 await asyncio.sleep(robots_delay)
 
-        start_wait = time.time()
-        await self.rate_limiter.acquire(domain)
-        if time.time() - start_wait > 0.01:   
+        waited = await self.rate_limiter.acquire(domain)
+        if waited > 0.01:
             self._rate_limited += 1
 
         #  Доп задержка 
@@ -377,7 +465,7 @@ class PoliteCrawler(AdvancedCrawler):
             return
 
         self.queue.mark_processed(url, result)
-        logger.info(f"good [{current_depth}] {url} — {result["links_count"]} ссылок, {fetch_elapsed:.2f} сек")
+        logger.info(f"good [{current_depth}] {url} — {result['links_count']} ссылок, {fetch_elapsed:.2f} сек")
 
         next_depth = current_depth + 1
         if next_depth > self.max_depth:
@@ -421,7 +509,7 @@ class PoliteCrawler(AdvancedCrawler):
             "failed": len(self.queue.failed),
             "in_queue": self.queue.size(),
             "blocked_by_robots": self._blocked_by_robots,
-            "rate_limited_times": self._rate_limited,
+            "rate_limiter": self.rate_limiter.stats(),
             "avg_response_time": round(avg_response, 3),
             "requests_per_second": round(rps, 2),
             "elapsed": round(elapsed, 2),
@@ -553,11 +641,64 @@ async def test_robots():
 
     await crawler.close()
 
+async def test_rate_limiter_burst():
+    print()
+    print("ТЕСТ RateLimiter — BURST")
+
+    limiter = RateLimiter(requests_per_second=2.0, burst=3, per_domain=True)
+
+    timestamps = []
+    async def task(i):
+        await limiter.acquire("example.com")
+        timestamps.append(time.time())
+
+    start = time.time()
+    await asyncio.gather(*[task(i) for i in range(6)])
+    elapsed = time.time() - start
+
+    timestamps.sort()
+    intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps) - 1)]
+
+    print(f"  6 запросов, burst=3, rate=2 RPS")
+    print(f"  Всего: {elapsed:.2f} сек")
+    print(f"  Интервалы: {[round(x, 2) for x in intervals]}")
+
+    assert 1.2 <= elapsed <= 2.0, f"Ожидалось 1.5, получено {elapsed:.2f}"
+    print(" Burst работает, далее — ограничение по rate")    
+
+async def test_rate_limiter_concurrent():
+    print()
+    print("ТЕСТ RateLimiter — КОНКУРЕНТНОСТЬ")
+
+    limiter = RateLimiter(requests_per_second=5.0, burst=1, per_domain=True)
+
+    timestamps = []
+    async def task(i):
+        await limiter.acquire("example.com")
+        timestamps.append(time.time())
+
+    start = time.time()
+    await asyncio.gather(*[task(i) for i in range(10)])
+    elapsed = time.time() - start
+
+    timestamps.sort()
+    intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps) - 1)]
+    min_interval = min(intervals) if intervals else 0
+
+    print(f"  10 запросов, burst=1, rate=5 RPS")
+    print(f"  Всего: {elapsed:.2f} сек)")
+    print(f"  Минимальный интервал: {min_interval:.3f} сек")
+
+    assert min_interval >= 0.15, f"Есть пачка: min interval = {min_interval:.3f}"
+    print(" Пачек нет, интервалы соблюдаются")
+
 async def main():
     await test_rate_limiter()
     await test_rate_limiter_domains()
     await test_robots()
     await test_blocked()
+    await test_rate_limiter_burst()
+    await test_rate_limiter_concurrent()
     await demo()
 
 

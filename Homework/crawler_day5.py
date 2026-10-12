@@ -96,6 +96,7 @@ class RetryStrategy:
     ):
         """Выполнить корутину с повторами"""
         last_error = None
+        timeout = None
 
         for attempt in range(1, self.max_retries + 1):
             self.stats["attempts"] += 1
@@ -126,8 +127,9 @@ class RetryStrategy:
 
 
             except asyncio.TimeoutError as e:
+                timeout_str = f"{timeout:.1f}s" if timeout is not None else "?"
                 timeout_err = TransientError(
-                    f"Timeout {timeout}s на попытке {attempt}: "
+                    f"Timeout {timeout_str} на попытке {attempt}: "
                     f"{args[0] if args else '?'}"
                 )
                 last_error = timeout_err
@@ -283,6 +285,8 @@ class ReliableCrawler(PoliteCrawler):
         base_delay: float = 0.5,
         circuit_threshold: int = 5,
         circuit_timeout: float = 30.0,
+        min_delay: float = 0.0,       
+        jitter: float = 0.0,          
     ):
         super().__init__(
             max_concurrent=max_concurrent,
@@ -290,8 +294,8 @@ class ReliableCrawler(PoliteCrawler):
             requests_per_second=requests_per_second,
             per_domain_limit=True,
             respect_robots=respect_robots,
-            min_delay=0.0,
-            jitter=0.0,
+            min_delay=min_delay,      
+            jitter=jitter,            
             user_agent=user_agent,
         )
 
@@ -313,6 +317,31 @@ class ReliableCrawler(PoliteCrawler):
 
         self._blocked_by_circuit = 0
         self.BASE_TIMEOUT = 30.0
+
+        self._crawl_delay_locks: dict[str, asyncio.Lock] = {}
+        self._last_request_by_domain: dict[str, float] = {}
+
+    def _get_delay_lock(self, domain: str) -> asyncio.Lock:
+        lock = self._crawl_delay_locks.get(domain)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._crawl_delay_locks[domain] = lock
+        return lock
+
+    async def _wait_crawl_delay(self, domain: str, delay: float):
+        """Соблюсти Crawl-delay: не чаще одного запроса в delay секунд на домен"""
+        if delay <= 0:
+            return
+
+        lock = self._get_delay_lock(domain)
+        async with lock:
+            now = time.time()
+            last = self._last_request_by_domain.get(domain, 0.0)
+            wait = delay - (now - last)
+            if wait > 0:
+                logger.debug(f" Crawl-delay: ждём {wait:.2f} сек для {domain}")
+                await asyncio.sleep(wait)
+            self._last_request_by_domain[domain] = time.time()
 
     async def fetch_url(self, url: str) -> str | None:
         """Загрузка с классификацией ошибок по HTTP-кодам"""
@@ -365,14 +394,28 @@ class ReliableCrawler(PoliteCrawler):
             return
 
         if self.respect_robots:
-            await self.robots_parser.fetch_robots(url)
-            if not self.robots_parser.can_fetch(url, self.user_agent):
-                logger.info(f" Заблокировано robots.txt: {url}")
-                self.queue.mark_failed(url, "blocked by robots.txt")
-                self._blocked_by_robots += 1
-                return
+            try:
+                await self.robots_parser.fetch_robots(url)
+            except Exception as e:
+                # robots.txt недоступен — не блокируем обход
+                logger.warning(f" Ошибка загрузки robots.txt для {domain}: {e}")
+
+            else:
+                if not self.robots_parser.can_fetch(url, self.user_agent):
+                    logger.info(f" Заблокировано robots.txt: {url}")
+                    self.queue.mark_failed(url, "blocked by robots.txt")
+                    self._blocked_by_robots += 1
+                    return
+
+                robots_delay = self.robots_parser.get_crawl_delay(url)
+                if robots_delay > 0:
+                    await self._wait_crawl_delay(domain, robots_delay)
 
         await self.rate_limiter.acquire(domain)
+
+        if self.min_delay > 0:
+            extra = self.min_delay + random.uniform(0, self.jitter)
+            await asyncio.sleep(extra)
 
         # Загрузка с retry
         start = time.time()
@@ -476,11 +519,11 @@ async def demo():
     )
 
     urls = [
-        "https://www.python.org",           #  200
-        "https://httpbin.org/status/404",    #  PermanentError
-        "https://httpbin.org/status/500",    #  TransientError - retry
-        "https://httpbin.org/status/503",    #  TransientError - retry
-        "https://httpbin.org/status/429",    #  TransientError - retry
+        "https://www.python.org",
+        "https://httpstat.us/404",
+        "https://httpstat.us/500",
+        "https://httpstat.us/503",
+        "https://httpstat.us/429",
     ]
 
     try:
@@ -670,12 +713,126 @@ async def test_timeout():
     print(f"   Время: {elapsed:.2f} сек")
     print(f"   by_error_type: {strategy.stats['by_error_type']}")
 
+async def test_robots_missing():
+    """Отсутствующий robots.txt не должен останавливать обход"""
+    print()
+    print("ТЕСТ: отсутствующий robots.txt")
+
+    crawler = ReliableCrawler(
+        max_concurrent=3,
+        max_depth=0,
+        respect_robots=True,
+        user_agent="TestBot/1.0",
+    )
+
+    # example.com обычно не имеет robots.txt, либо отдаёт 404
+    try:
+        results = await crawler.crawl(
+            start_urls=["https://example.com"],
+            max_pages=2,
+            max_depth=0,
+            same_domain_only=True,
+            progress_every=100,
+        )
+    finally:
+        await crawler.close()
+
+    print(f"  Обработано: {len(results)}")
+    print(f"  Заблокировано robots: {crawler._blocked_by_robots}")
+    print(f"  Упало: {len(crawler.queue.failed)}")
+
+    assert len(results) >= 1, "Обход упал из-за отсутствующего robots.txt"
+    print(" Отсутствующий robots.txt не блокирует обход")    
+
+
+async def test_crawl_delay():
+    print()
+    print("ТЕСТ: Crawl-delay из robots.txt")
+
+    crawler = ReliableCrawler(
+        max_concurrent=3,
+        max_depth=0,
+        requests_per_second=100.0,   
+        respect_robots=True,
+        user_agent="TestBot/1.0",
+        min_delay=0.0,
+        jitter=0.0,
+    )
+
+    original_fetch = crawler.robots_parser.fetch_robots
+    async def fake_fetch(base_url):
+        domain = urlparse(base_url).netloc
+        crawler.robots_parser._cache[domain] = {
+            "domain": domain,
+            "disallow": [],
+            "allow": [],
+            "crawl_delay": 1.0,   
+            "loaded": True,
+        }
+        return crawler.robots_parser._cache[domain]
+
+    crawler.robots_parser.fetch_robots = fake_fetch
+
+    urls = [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ]
+
+    start = time.time()
+    try:
+        await crawler.crawl(
+            start_urls=urls, max_pages=3, max_depth=0,
+            same_domain_only=True, progress_every=100,
+        )
+    finally:
+        await crawler.close()
+    elapsed = time.time() - start
+
+    print(f"  3 URL, Crawl-delay=1, rate=100 RPS")
+    print(f"  Время: {elapsed:.2f} сек")
+
+
+async def test_min_delay():
+    print()
+    print("ТЕСТ: min_delay")
+
+    crawler = ReliableCrawler(
+        max_concurrent=1,
+        max_depth=0,
+        requests_per_second=100.0,
+        respect_robots=False,      # robots не мешает
+        min_delay=0.5,
+        jitter=0.0,
+    )
+
+    urls = [f"https://example.com/{i}" for i in range(3)]
+
+    start = time.time()
+    try:
+        await crawler.crawl(
+            start_urls=urls, max_pages=3, max_depth=0,
+            same_domain_only=True, progress_every=100,
+        )
+    finally:
+        await crawler.close()
+    elapsed = time.time() - start
+
+    print(f"  3 URL, min_delay=0.5")
+    print(f"  Время: {elapsed:.2f} сек")
+
+    assert elapsed >= 1.3, f"min_delay не работает: {elapsed:.2f}"
+    print(" min_delay работает")    
+
 
 async def main():
     await test_retry_strategy()
     await test_per_type_backoff()
     await test_circuit_breaker()
     await test_timeout()
+    await test_robots_missing()
+    await test_crawl_delay()
+    await test_min_delay()
     await demo()
 
 

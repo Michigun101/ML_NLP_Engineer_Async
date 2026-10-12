@@ -145,6 +145,7 @@ class AdvancedCrawler(CrawlerWithParser):
     def __init__(self, max_concurrent=10, max_depth=2,
                  global_limit=10, per_domain_limit=5):
         super().__init__(max_concurrent)
+        self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         self.queue = CrawlerQueue()
         self.semaphores = SemaphoreManager(global_limit, per_domain_limit)
@@ -183,35 +184,60 @@ class AdvancedCrawler(CrawlerWithParser):
 
         self._start_time = time.time()
 
-        logger.info(f' Старт: {len(start_urls)} URL, max_pages={max_pages}, max_depth={self.max_depth}, same_domain={same_domain_only}')
+        logger.info(f' Старт: {len(start_urls)} URL, max_pages={max_pages}, '
+                    f'max_depth={self.max_depth}, same_domain={same_domain_only}')
 
         processed_count = 0
+        counter_lock = asyncio.Lock()
 
-        while processed_count < max_pages and not self.queue.is_empty():
-            url = await self.queue.get_next()
+        async def worker(worker_id: int):
+            nonlocal processed_count
+            idle_rounds = 0
 
-            if url is None:
-                break
+            while True:
+                async with counter_lock:
+                    if processed_count >= max_pages:
+                        return
 
-            if url in self.queue.processed:
-                continue
+                url = await self.queue.get_next()
 
-            current_depth = self.depth.get(url, 0)
-            if current_depth > self.max_depth:
-                logger.debug(f' Слишком глубоко ({current_depth}): {url}')
-                continue
+                if url is None:
+                    # очередь пуста 
+                    idle_rounds += 1
+                    if idle_rounds > 50:   
+                        return
+                    await asyncio.sleep(0.1)
+                    continue
 
-            is_start = current_depth == 0
-            if not is_start and not self._should_visit(url):
-                logger.debug(f'  Отфильтрован: {url}')
-                continue
+                idle_rounds = 0   # нашли URL — сбрасываем счётчик простоя
 
-            await self._process_one(url, current_depth)
+                if url in self.queue.processed:
+                    continue
 
-            processed_count += 1
+                current_depth = self.depth.get(url, 0)
+                if current_depth > self.max_depth:
+                    continue
 
-            if processed_count % progress_every == 0:
-                self._log_progress(processed_count)
+                is_start = current_depth == 0
+                if not is_start and not self._should_visit(url):
+                    continue
+
+                try:
+                    await self._process_one(url, current_depth)
+                except Exception as e:
+                    logger.exception(f" Необработанная ошибка в _process_one({url}): {e}")
+                    self.queue.mark_failed(url, f"unhandled: {e}")
+                finally:
+                    async with counter_lock:
+                        processed_count += 1
+                        if processed_count % progress_every == 0:
+                            self._log_progress(processed_count)                    
+
+        workers = [
+            asyncio.create_task(worker(i))
+            for i in range(self.max_concurrent)
+        ]
+        await asyncio.gather(*workers)
 
         return self.queue.processed
 
@@ -478,7 +504,51 @@ async def test_duplicates():
 
     print(f"\nvisited_urls в очереди: {len(crawler.queue.visited_urls)}")
     print(f"processed: {len(crawler.queue.processed)}")
-    print(f"failed: {len(crawler.queue.failed)}")    
+    print(f"failed: {len(crawler.queue.failed)}")   
+
+
+async def test_parallelism():
+    """Проверить, что несколько страниц обрабатываются одновременно."""
+    print()
+    print("ТЕСТ ПАРАЛЛЕЛИЗМА")
+
+    crawler = AdvancedCrawler(
+        max_concurrent=5,
+        global_limit=5,
+        per_domain_limit=5,
+        max_depth=1,
+    )
+
+    active = 0
+    max_active = 0
+
+    original_process = crawler._process_one
+    async def tracking_process(url, depth):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.3)          # имитируем сетевую задержку
+            return await original_process(url, depth)
+        finally:
+            active -= 1
+
+    crawler._process_one = tracking_process
+
+    try:
+        await crawler.crawl(
+            start_urls=["https://www.python.org"],
+            max_pages=8,
+            max_depth=1,
+            same_domain_only=True,
+            progress_every=100,
+        )
+    finally:
+        await crawler.close()
+
+    print(f"  Максимум одновременных задач: {max_active}")
+    assert max_active > 1, f"Параллелизма нет: max_active={max_active}"
+    print(" Параллелизм работает")     
 
 async def main():
     test_normalization()
@@ -488,7 +558,8 @@ async def main():
     await test_depth()
     await test_filters()
     await test_duplicates()
-
+    await test_parallelism()
+    
 
 if __name__ == '__main__':
     asyncio.run(main())

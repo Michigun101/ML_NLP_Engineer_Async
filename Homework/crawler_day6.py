@@ -7,7 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-
+import sqlite3
 import aiofiles
 import aiosqlite
 
@@ -204,11 +204,18 @@ class SQLiteStorage(DataStorage):
 
         self.path = path
         self.batch_size = batch_size
+        self._lock = asyncio.Lock()
         self._conn: aiosqlite.Connection | None = None
         self._buffer: list[tuple] = []
         self._saved = 0
         self._errors = 0
         self._duplicates = 0
+
+        self._insert_sql = """
+            INSERT OR IGNORE INTO pages
+            (url, title, text, links, metadata, crawled_at, status_code, content_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
 
     async def init_db(self):
         """Создать таблицы и индексы."""
@@ -240,7 +247,13 @@ class SQLiteStorage(DataStorage):
 
     async def _ensure_open(self):
         """Открыть соединение и создать схему."""
-        if self._conn is None:
+        if self._conn is None or not self._conn._running:
+            if self._conn is not None:
+                try:
+                    await self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
             await self.init_db()
 
     def _prepare_row(self, data: dict) -> tuple:
@@ -269,37 +282,41 @@ class SQLiteStorage(DataStorage):
             await self._flush()
 
     async def _flush(self):
-        """Записать буфер в БД одним batch"""
         if not self._buffer:
             return
 
-        try:
-            cursor = await self._conn.executemany(
-                """
-                INSERT OR IGNORE INTO pages
-                    (url, title, text, links, metadata,
-                     crawled_at, status_code, content_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                self._buffer,
-            )
+        async with self._lock:
+            if not self._buffer:
+                return
 
+            batch = list(self._buffer)
+
+            try:
+                cursor = await self._conn.executemany(self._insert_sql, batch)
+                await self._conn.commit()
+            except Exception as e:
+                self._errors += 1
+                logger.error(
+                    " Не удалось записать batch из %d записей: %s",
+                    len(batch), e,
+                )
+                raise
+
+            #  подсчёт дублей по rowcount
             inserted = cursor.rowcount
-            duplicates = len(self._buffer) - inserted
-
+            self._duplicates += len(batch) - inserted
             self._saved += inserted
-            self._duplicates += duplicates
 
-            await self._conn.commit()
-            logger.debug(f"Flush: +{inserted} записей ({duplicates} дублей)")
+            for row in batch:
+                try:
+                    self._buffer.remove(row)
+                except ValueError:
+                    pass
 
-        except Exception as e:
-            self._errors += 1
-            logger.error(f"Ошибка flush в SQLite: {e}")
-            raise
-
-        finally:
-            self._buffer = []
+            logger.debug(
+                " Записано %d из %d (дублей: %d)",
+                inserted, len(batch), len(batch) - inserted,
+            )
 
     async def close(self) -> None:
         """Финальный flush и закрытие"""
@@ -345,35 +362,65 @@ class SQLiteStorage(DataStorage):
 class StoringCrawler(ReliableCrawler):
     """ReliableCrawler с автоматическим сохранением данных"""
 
-    def __init__(
-        self,
-        storage: DataStorage,
-        **kwargs,
-    ):
+    MAX_SAVE_RETRIES = 3
+    BASE_SAVE_DELAY = 0.5
+
+    def __init__(self,storage: DataStorage,**kwargs,):
         super().__init__(**kwargs)
         self.storage = storage
+
+    async def _save_with_retry(self, data: dict):
+        """Сохранить с повторами"""
+        last_error = None
+
+        for attempt in range(1, self.MAX_SAVE_RETRIES + 1):
+            try:
+                await self.storage.save(data)
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    " Ошибка сохранения (попытка %d/%d): %s",
+                    attempt, self.MAX_SAVE_RETRIES, e,
+                )
+                if attempt < self.MAX_SAVE_RETRIES:
+                    delay = self.BASE_SAVE_DELAY * (2 ** (attempt - 1))
+                    await asyncio.sleep(delay)
+
+        # Все попытки исчерпаны — логируем и не теряем данные
+            logger.error(
+            " Не удалось сохранить после %d попыток: %s",
+            self.MAX_SAVE_RETRIES, last_error,
+        )
+        raise last_error
 
     async def _process_one(self, url: str, current_depth: int):
         await super()._process_one(url, current_depth)
 
-        if url in self.queue.processed:
-            result = self.queue.processed[url]
+        if url not in self.queue.processed:
+            return
 
-            result["crawled_at"] = datetime.now().isoformat()
-            result["status_code"] = 200
-            result["content_type"] = "text/html"
+        result = self.queue.processed[url]
+        result["crawled_at"] = datetime.now().isoformat()
+        result["status_code"] = 200
+        result["content_type"] = "text/html"
 
-            try:
-                await self.storage.save(result)
-                logger.debug(" Сохранено: %s", url)
-            except Exception as e:
-                logger.error(" Ошибка сохранения %s: %s", url, e)
+        try:
+            await self._save_with_retry(result)
+        except Exception as e:
+            logger.error(" Не удалось сохранить %s: %s", url, e)
+            self._save_failures = getattr(self, "_save_failures", 0) + 1
+            #  пометить URL как несохранённый (не через queue.failed,
+            #    потому что он уже в processed)
+            self._unsaved_urls = getattr(self, "_unsaved_urls", set())
+            self._unsaved_urls.add(url)
 
     async def close(self):
+        """Закрыть storage и сам краулер."""
         try:
             await self.storage.close()
         except Exception as e:
-            logger.error(f"Ошибка закрытия storage: {e}")
+            logger.error(" Ошибка закрытия storage: %s", e)
 
         await super().close()
 
@@ -600,11 +647,81 @@ async def test_save_error():
     assert len(results) > 0, "Краулер должен был обработать хотя бы одну страницу!"
     print(f"  Краулер НЕ упал, несмотря на {storage.save_errors} ошибок storage")
 
+
+async def test_sqlite_flush_retains_on_error():
+    print()
+    print("ТЕСТ: SQLite не теряет batch при ошибке flush")
+
+    storage = SQLiteStorage(":memory:", batch_size=3)
+    await storage._ensure_open()
+
+    storage._buffer.append(storage._prepare_row({"url": "a", "title": "A"}))
+    storage._buffer.append(storage._prepare_row({"url": "b", "title": "B"}))
+    storage._buffer.append(storage._prepare_row({"url": "c", "title": "C"}))
+
+    await storage._conn.close()
+
+    try:
+        await storage._flush()
+        print("  _flush НЕ упал")
+    except Exception as e:
+        print(f"  Ожидаемо упало: {type(e).__name__}: {e}")
+
+    print(f"  Записей в буфере после ошибки: {len(storage._buffer)}")
+    assert len(storage._buffer) == 3, "Batch потерян при ошибке!"
+
+    # Восстанавливаем
+    storage._conn = None
+    await storage._ensure_open()
+    await storage._flush()
+
+    print(f"  Записей в буфере после успешного flush: {len(storage._buffer)}")
+    assert len(storage._buffer) == 0
+
+    await storage.close()
+    print(" Batch не теряется при ошибке flush")
+
+async def test_storing_crawler_save_failure():
+    print()
+    print("ТЕСТ: неудачное сохранение не валит краулер")
+
+    class BrokenStorage(DataStorage):
+        def __init__(self):
+            self.save_calls = 0
+
+        async def save(self, data):
+            self.save_calls += 1
+            raise RuntimeError("диск переполнен")
+
+        async def close(self):
+            pass
+
+    storage = BrokenStorage()
+    crawler = StoringCrawler(storage=storage, max_depth=0)
+
+    try:
+        results = await crawler.crawl(
+            start_urls=["https://example.com"],
+            max_pages=1,
+            max_depth=0,
+        )
+    finally:
+        await crawler.close()
+
+    print(f"  Обработано: {len(results)}")
+    print(f"  Попыток сохранения: {storage.save_calls}")
+
+    assert len(results) >= 1, "Краулер не обработал страницу"
+    assert storage.save_calls >= 1, "Сохранение не вызывалось"
+    print(" Ошибка storage не валит краулер, страница обработана")
+
 async def main():
     await test_json_storage()
     await test_csv_storage()
     await test_sqlite_storage()
     await test_save_error()      
+    await test_sqlite_flush_retains_on_error()      
+    await test_storing_crawler_save_failure()      
     await demo()
 
 
