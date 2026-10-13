@@ -25,7 +25,13 @@ logger = logging.getLogger(__name__)
 
 class CrawlerError(Exception):
     """Базовое исключение краулера"""
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def error_type(self) -> str:
+        return type(self).__name__
 
 
 class TransientError(CrawlerError):
@@ -356,29 +362,26 @@ class ReliableCrawler(PoliteCrawler):
                     status = response.status
 
                     if status == 429:
-                        raise TransientError(f"429 Too Many Requests: {url}")
-                        
+                        raise TransientError(f"429 Too Many Requests: {url}", status_code=429)
                     if status in (500, 502, 503, 504):
-                        raise TransientError(f"{status} Server Error: {url}")
-                        
+                        raise TransientError(f"{status} Server Error: {url}", status_code=status)
                     if status in (401, 403):
-                        raise PermanentError(f"{status} Forbidden/Unauthorized: {url}")
-                        
+                        raise PermanentError(f"{status} Forbidden/Unauthorized: {url}", status_code=status)
                     if status == 404:
-                        raise PermanentError(f"404 Not Found: {url}")
-                        
+                        raise PermanentError(f"404 Not Found: {url}", status_code=404)
+                                            
                     # Прочие 4xx/5xx
                     response.raise_for_status()
 
                     text = await response.text()
                     elapsed = time.time() - start
-                    logger.info(" Успех: %s (%.2f сек, %d символов)",url, elapsed, len(text))
-                    return text
+                    logger.info(" Успех: %s (%.2f сек, %d символов)", url, elapsed, len(text))
+                    return text, status 
 
             except asyncio.TimeoutError as e:
                 raise TransientError(f"Timeout: {url}") from e
             except aiohttp.ClientResponseError as e:
-                raise PermanentError(f"HTTP {e.status}: {url}") from e
+                raise PermanentError(f"HTTP {e.status}: {url}", status_code=e.status) from e
             except aiohttp.ClientError as e:
                 raise NetworkError(f"Network: {url} — {e}") from e
 
@@ -436,19 +439,19 @@ class ReliableCrawler(PoliteCrawler):
 
         except PermanentError as e:
             self.circuit_breaker.record_failure(domain)
-            self.queue.mark_failed(url, f"PermanentError: {e}")
+            self.queue.mark_failed(url, e)
             logger.warning(f" Permanent: {url}")
             return
 
         except (TransientError, NetworkError) as e:
             self.circuit_breaker.record_failure(domain)
-            self.queue.mark_failed(url, f"All retries failed: {e}")
+            self.queue.mark_failed(url, e)
             logger.warning(f" Все retry исчерпаны: {url}")
             return
 
         except Exception as e:
             self.circuit_breaker.record_failure(domain)
-            self.queue.mark_failed(url, f"Unexpected: {e}")
+            self.queue.mark_failed(url, e)
             logger.exception(f" Неожиданная ошибка: {url}", )
             return
 

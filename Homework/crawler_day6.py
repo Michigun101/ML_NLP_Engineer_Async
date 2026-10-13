@@ -54,6 +54,7 @@ class JSONStorage(DataStorage):
         self._saved = 0
         self._errors = 0
         self.indent = indent
+        self._lock = asyncio.Lock()
 
     async def _ensure_open(self):
         """Открыть файл, если ещё не открыт"""
@@ -66,17 +67,17 @@ class JSONStorage(DataStorage):
         if not isinstance(data, dict):
             raise ValueError(f"data должен быть dict, получено {type(data).__name__}")
 
-        await self._ensure_open()
-
-        try:
-            line = json.dumps(data, ensure_ascii=False, indent=self.indent)
-            await self._file.write(line + "\n")
-            await self._file.flush()   
-            self._saved += 1
-        except Exception as e:
-            self._errors += 1
-            logger.error(f"Ошибка записи в JSON: {e}")
-            raise
+        async with self._lock:
+            await self._ensure_open()
+            try:
+                line = json.dumps(data, ensure_ascii=False, indent=self.indent)
+                await self._file.write(line + "\n")
+                await self._file.flush()   
+                self._saved += 1
+            except Exception as e:
+                self._errors += 1
+                logger.error(f"Ошибка записи в JSON: {e}")
+                raise
 
     async def close(self) -> None:
         """Закрыть файл"""
@@ -107,6 +108,7 @@ class CSVStorage(DataStorage):
         self._headers: list[str] | None = None
         self._saved = 0
         self._errors = 0
+        self._lock = asyncio.Lock() 
 
     def _flatten(self, data: dict) -> dict:
         """Сериализовать сложные поля в строки"""
@@ -154,24 +156,25 @@ class CSVStorage(DataStorage):
 
         flat = self._flatten(data)
 
-        if self._headers is None:
-            self._headers = list(flat.keys())
+        async with self._lock:  
+            if self._headers is None:
+                self._headers = list(flat.keys())
 
-        await self._ensure_open(self._headers)
+            await self._ensure_open(self._headers)
 
-        try:
-            self._writer.writerow(flat)
-            await self._file.write(self._buffer.getvalue())
-            await self._file.flush()
+            try:
+                self._writer.writerow(flat)
+                await self._file.write(self._buffer.getvalue())
+                await self._file.flush()
 
-            self._buffer.seek(0)
-            self._buffer.truncate(0)
+                self._buffer.seek(0)
+                self._buffer.truncate(0)
 
-            self._saved += 1
-        except Exception as e:
-            self._errors += 1
-            logger.error(f"Ошибка записи в CSV: {e}")
-            raise
+                self._saved += 1
+            except Exception as e:
+                self._errors += 1
+                logger.error(f"Ошибка записи в CSV: {e}")
+                raise
 
     async def close(self) -> None:
         if self._file is not None:
@@ -714,6 +717,7 @@ async def test_storing_crawler_save_failure():
     assert len(results) >= 1, "Краулер не обработал страницу"
     assert storage.save_calls >= 1, "Сохранение не вызывалось"
     print(" Ошибка storage не валит краулер, страница обработана")
+
 
 async def main():
     await test_json_storage()

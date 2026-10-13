@@ -1,3 +1,4 @@
+from aiohttp import web
 
 import requests
 import argparse
@@ -440,29 +441,26 @@ class FinalCrawler(StoringCrawler):
         return results
 
     def _collect_stats(self, results: dict):
-        """Перенести данные из родителя в CrawlerStats."""
         for url, data in results.items():
-            self.stats.record(
-                url=url,
-                status_code=200,
-                success=True,
-            )
+            #  status_code берём из данных, если он там есть
+            status_code = data.get("status_code", 200)
+            self.stats.record(url=url, status_code=status_code, success=True)
 
-        for url, error in self.queue.failed.items():
-            error_type = "UnknownError"
-            error_str = str(error)
-            for known in ("PermanentError", "TransientError", "NetworkError"):
-                if known in error_str:
-                    error_type = known
-                    break
-            if "circuit" in error_str.lower():
-                error_type = "CircuitOpen"
-            if "robots" in error_str.lower():
-                error_type = "RobotsBlocked"
+        for url, error_info in self.queue.failed.items():
+            # error_info — dict из mark_failed
+            if isinstance(error_info, dict):
+                status_code = error_info.get("status_code") or 0
+                error_type = error_info.get("error_type", "UnknownError")
+            else:
+                status_code = 0
+                error_type = "UnknownError"
+
+            if error_type in ("CircuitOpen", "RobotsBlocked"):
+                pass  
 
             self.stats.record(
                 url=url,
-                status_code=0,
+                status_code=status_code,
                 success=False,
                 error_type=error_type,
             )
@@ -881,6 +879,74 @@ async def test_config_delay():
     await crawler.close()
     print(" Параметры доходят из конфига")
 
+async def start_mock_server(port: int = 8765):
+    async def handler(request):
+        path = request.path.strip("/")
+        if path == "200":
+            return web.Response(
+                text="<html><head><title>OK</title></head><body>OK</body></html>",
+                content_type="text/html",
+                status=200,
+            )
+        if path == "404":
+            return web.Response(text="not found", status=404)
+        if path == "500":
+            return web.Response(text="error", status=500)
+        if path == "503":
+            return web.Response(text="unavailable", status=503)
+        if path == "429":
+            return web.Response(text="slow down", status=429)
+        return web.Response(text="unknown", status=400)
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    return runner
+
+
+async def test_stats_real_codes():
+    print()
+    print("ТЕСТ: реальные HTTP-коды в статистике")
+
+    runner = await start_mock_server(port=8765)
+    base = "http://127.0.0.1:8765"
+
+    try:
+        config = CrawlerConfig.from_dict({
+            "start_urls": [f"{base}/200", f"{base}/404", f"{base}/500"],
+            "max_pages": 5,
+            "max_depth": 0,
+            "same_domain_only": False,
+            "respect_robots": False,
+            "max_retries": 1,
+        })
+
+        storage = _create_storage(config["storage"])
+        crawler = FinalCrawler(config=config, storage=storage)
+
+        try:
+            await crawler.crawl(max_pages=5, max_depth=0)
+        finally:
+            await crawler.close()
+
+        s = crawler.get_stats()
+        print(f"  status_codes: {s['status_codes']}")
+        print(f"  error_types:  {s['error_types']}")
+
+        assert 200 in s["status_codes"], f"Нет 200 в {s['status_codes']}"
+        assert 404 in s["status_codes"], f"Нет 404 в {s['status_codes']}"
+        assert 500 in s["status_codes"], f"Нет 500 в {s['status_codes']}"
+        assert "UnknownError" not in s["error_types"], \
+            f"UnknownError в {s['error_types']}"
+        print(" Реальные коды и типы ошибок в статистике")
+    finally:
+        await runner.cleanup()
+
+
 async def main():
     setup_logging("crawler_day7.log", "INFO")
 
@@ -891,6 +957,7 @@ async def main():
     await test_final_crawler()
     await test_performance()
     await test_config_delay()
+    await test_stats_real_codes()
 
 
 if __name__ == "__main__":

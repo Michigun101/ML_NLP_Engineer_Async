@@ -96,10 +96,22 @@ class CrawlerQueue:
         self.processed[url] = result
         self._queued.discard(url)   
 
-    def mark_failed(self, url: str, error: str):
-        '''Пометка URL как неудачного'''
+    def mark_failed(self, url: str, error, status_code: int | None = None,
+                error_type: str | None = None):
         url = normalize_url(url)
-        self.failed[url] = error
+        if isinstance(error, Exception):
+            info = {
+                "message": str(error),
+                "error_type": error_type or type(error).__name__,
+                "status_code": status_code if status_code is not None else getattr(error, "status_code", None),
+            }
+        else:
+            info = {
+                "message": str(error),
+                "error_type": error_type or "UnknownError",
+                "status_code": status_code,
+            }
+        self.failed[url] = info
         self._queued.discard(url)
 
     def get_stats(self) -> dict:
@@ -195,43 +207,54 @@ class AdvancedCrawler(CrawlerWithParser):
             idle_rounds = 0
 
             while True:
+                # Проверка лимита + резервирование слота — атомарно
                 async with counter_lock:
                     if processed_count >= max_pages:
                         return
+                    processed_count += 1        
+                    my_slot = processed_count
 
                 url = await self.queue.get_next()
 
                 if url is None:
-                    # очередь пуста 
+                    # нечего обрабатывать, возвращаем слот обратно
+                    async with counter_lock:
+                        processed_count -= 1
                     idle_rounds += 1
-                    if idle_rounds > 50:   
+                    if idle_rounds > 50:
                         return
                     await asyncio.sleep(0.1)
                     continue
 
-                idle_rounds = 0   # нашли URL — сбрасываем счётчик простоя
+                idle_rounds = 0
 
                 if url in self.queue.processed:
+                    async with counter_lock:
+                        processed_count -= 1    # слот не нужен
                     continue
 
                 current_depth = self.depth.get(url, 0)
                 if current_depth > self.max_depth:
+                    async with counter_lock:
+                        processed_count -= 1
                     continue
 
                 is_start = current_depth == 0
                 if not is_start and not self._should_visit(url):
+                    async with counter_lock:
+                        processed_count -= 1
                     continue
 
+                # Обрабатываем — слот уже зарезервирован
                 try:
                     await self._process_one(url, current_depth)
                 except Exception as e:
                     logger.exception(f" Необработанная ошибка в _process_one({url}): {e}")
                     self.queue.mark_failed(url, f"unhandled: {e}")
-                finally:
-                    async with counter_lock:
-                        processed_count += 1
-                        if processed_count % progress_every == 0:
-                            self._log_progress(processed_count)                    
+
+                # Прогресс
+                if my_slot % progress_every == 0:
+                    self._log_progress(my_slot)
 
         workers = [
             asyncio.create_task(worker(i))
@@ -239,7 +262,7 @@ class AdvancedCrawler(CrawlerWithParser):
         ]
         await asyncio.gather(*workers)
 
-        return self.queue.processed
+        return self.queue.processed 
 
     async def _process_one(self, url: str, current_depth: int):
         '''Обработка одной страницы'''
@@ -550,6 +573,43 @@ async def test_parallelism():
     assert max_active > 1, f"Параллелизма нет: max_active={max_active}"
     print(" Параллелизм работает")     
 
+async def test_max_pages_strict():
+    """max_pages не должен превышаться даже при параллельных воркерах"""
+    print()
+    print("ТЕСТ: строгое соблюдение max_pages")
+
+    crawler = AdvancedCrawler(
+        max_concurrent=5,
+        global_limit=5,
+        per_domain_limit=5,
+        max_depth=1,
+    )
+
+    # 5 стартовых URL, max_pages=1
+    urls = [
+        "https://www.python.org",
+        "https://www.python.org/about",
+        "https://www.python.org/community",
+        "https://www.python.org/psf",
+        "https://www.python.org/jobs",
+    ]
+
+    try:
+        results = await crawler.crawl(
+            start_urls=urls,
+            max_pages=1,
+            max_depth=0,
+            same_domain_only=True,
+            progress_every=100,
+        )
+    finally:
+        await crawler.close()
+
+    print(f"  Обработано: {len(results)} (ожидалось 1)")
+    assert len(results) == 1, f"max_pages нарушен: обработано {len(results)}"
+
+    print(" max_pages соблюдается строго")
+
 async def main():
     test_normalization()
     test_queue_dedup()
@@ -559,6 +619,7 @@ async def main():
     await test_filters()
     await test_duplicates()
     await test_parallelism()
+    await test_max_pages_strict()
     
 
 if __name__ == '__main__':
