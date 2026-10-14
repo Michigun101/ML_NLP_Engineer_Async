@@ -1,5 +1,6 @@
 from aiohttp import web
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 import argparse
 import asyncio
@@ -26,6 +27,26 @@ from crawler_day6 import (
 )
 
 logger = logging.getLogger(__name__)
+
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class _MockHandler(BaseHTTPRequestHandler):
+    delay = 1.0
+
+    def do_GET(self):
+        time.sleep(self.delay)
+        body = b"<html><head><title>OK</title></head><body>ok</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass   
 
 class SitemapParser:
     """Парсер sitemap.xml с поддержкой sitemap index"""
@@ -161,7 +182,7 @@ class CrawlerStats:
     def to_dict(self) -> dict:
         """Сериализовать в dict"""
         elapsed = (self.end_time or time.time()) - self.start_time
-        avg_rps = self.total_processed / elapsed if elapsed > 0 else 0
+        avg_rps = self.total_processed / elapsed if elapsed >= 0.01 else 0.0
 
         return {
             "total_pages": self.total_processed,
@@ -442,21 +463,16 @@ class FinalCrawler(StoringCrawler):
 
     def _collect_stats(self, results: dict):
         for url, data in results.items():
-            #  status_code берём из данных, если он там есть
-            status_code = data.get("status_code", 200)
+            status_code = data.get("status_code", 200)   
             self.stats.record(url=url, status_code=status_code, success=True)
 
         for url, error_info in self.queue.failed.items():
-            # error_info — dict из mark_failed
             if isinstance(error_info, dict):
                 status_code = error_info.get("status_code") or 0
                 error_type = error_info.get("error_type", "UnknownError")
             else:
                 status_code = 0
                 error_type = "UnknownError"
-
-            if error_type in ("CircuitOpen", "RobotsBlocked"):
-                pass  
 
             self.stats.record(
                 url=url,
@@ -820,29 +836,39 @@ async def test_final_crawler():
     print(f" HTML: {html_path}")
 
 async def test_performance():
-    """Тест производительности"""
     print()
     print("ТЕСТ ПРОИЗВОДИТЕЛЬНОСТИ")
 
-    urls = [f"https://httpbin.org/delay/1" for _ in range(5)]
+    server, thread = start_mock_server_thread(port=8765, delay=1.0)
+    base = "http://127.0.0.1:8765"
+    urls = [f"{base}/page{i}" for i in range(5)]
 
-    print("\nAsync")
-    crawler = FinalCrawler.from_config("config.yaml")
-
-    start = time.time()
-    await crawler.crawl(
-        start_urls=urls,
-        max_pages=5,
-        max_depth=0,
-        same_domain_only=True,
-    )
-    elapsed_async = time.time() - start
-    await crawler.close()
-
-    print(f"\n  Async: {elapsed_async:.2f} сек для 5 URL")
-
-    print("\nSync")
     try:
+        print("\nAsync")
+        
+        config = CrawlerConfig.from_dict({
+            "start_urls": urls,
+            "max_pages": 5,
+            "max_depth": 0,
+            "respect_robots": False,
+            "same_domain_only": True,
+            "max_concurrent": 5,
+            "requests_per_second": 100.0,   
+            "storage": {"type": "json", "path": "perf_async.jsonl"},
+        })
+        storage = _create_storage(config["storage"])
+        crawler = FinalCrawler(config=config, storage=storage)
+        print(f"  crawler.max_concurrent = {crawler.max_concurrent}")
+        start = time.time()
+        try:
+            await crawler.crawl(max_pages=5, max_depth=0)
+        finally:
+            await crawler.close()
+        elapsed_async = time.time() - start
+
+        print(f"  Async: {elapsed_async:.2f} сек для 5 URL")
+
+        print("\nSync")
         start = time.time()
         for url in urls:
             try:
@@ -850,12 +876,18 @@ async def test_performance():
             except Exception as e:
                 print(f"   Ошибка: {e}")
         elapsed_sync = time.time() - start
-        print(f"\n  Sync:  {elapsed_sync:.2f} сек для 5 URL")
+
+        print(f"  Sync:  {elapsed_sync:.2f} сек для 5 URL")
 
         speedup = elapsed_sync / elapsed_async if elapsed_async > 0 else 0
         print(f"\n Ускорение: {speedup:.2f}x")
-    except ImportError:
-        print("   requests не установлен — пропускаем")    
+
+        assert elapsed_async < 3.0, f"Async слишком долго: {elapsed_async:.2f}"
+        assert speedup > 2.5, f"Ускорение слишком низкое: {speedup:.2f}"
+        print(" Параллелизм работает")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 async def test_config_delay():
     print()
@@ -879,28 +911,39 @@ async def test_config_delay():
     await crawler.close()
     print(" Параметры доходят из конфига")
 
-async def start_mock_server(port: int = 8765):
+
+
+def start_mock_server_thread(port: int = 8765, delay: float = 1.0):
+    _MockHandler.delay = delay
+    server = ThreadingHTTPServer(("127.0.0.1", port), _MockHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+async def start_mock_server(port: int = 8765, delay: float = 0.0):
+    """Мок, отдающий разные коды по пути."""
     async def handler(request):
-        path = request.path.strip("/")
-        if path == "200":
-            return web.Response(
-                text="<html><head><title>OK</title></head><body>OK</body></html>",
-                content_type="text/html",
-                status=200,
-            )
+        path = request.path.strip("/") or "200"
+        if delay > 0:
+            await asyncio.sleep(delay)
+
         if path == "404":
             return web.Response(text="not found", status=404)
         if path == "500":
-            return web.Response(text="error", status=500)
+            return web.Response(text="server error", status=500)
         if path == "503":
             return web.Response(text="unavailable", status=503)
         if path == "429":
-            return web.Response(text="slow down", status=429)
-        return web.Response(text="unknown", status=400)
+            return web.Response(text="too many", status=429)
+
+        return web.Response(
+            text='<html><head><title>OK</title></head><body>ok</body></html>',
+            content_type="text/html",
+            status=200,
+        )
 
     app = web.Application()
     app.router.add_route("*", "/{tail:.*}", handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", port)
@@ -946,6 +989,51 @@ async def test_stats_real_codes():
     finally:
         await runner.cleanup()
 
+async def test_status_code_preserved():
+    """Успешная страница сохраняется с реальным HTTP-кодом."""
+    from aiohttp import web
+    async def handler(request):
+        return web.Response(
+            text='<html><head><title>Expected</title></head>'
+                 '<body><a href="/next">next</a></body></html>',
+            content_type="text/html",
+            status=201,
+        )
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8766)
+    await site.start()
+
+    try:
+        from crawler_day6 import JSONStorage
+        from crawler_day7 import FinalCrawler, CrawlerConfig
+
+        config = CrawlerConfig.from_dict({
+            "start_urls": ["http://127.0.0.1:8766/"],
+            "respect_robots": False,
+            "max_retries": 1,
+            "storage": {"type": "json", "path": "test_codes.jsonl"},
+        })
+        storage = JSONStorage("test_codes.jsonl")
+        crawler = FinalCrawler(config=config, storage=storage)
+        try:
+            results = await crawler.crawl(max_pages=1, max_depth=0)
+        finally:
+            await crawler.close()
+
+        url, data = next(iter(results.items()))
+        print(f"  title: {data['title']!r}, links: {data['links_count']}, "
+              f"status: {data.get('status_code')}")
+        assert data["title"] == "Expected"
+        assert data["links_count"] >= 1
+        assert data.get("status_code") == 201
+        print(" status_code и содержимое сохранены")
+    finally:
+        await runner.cleanup()
+
+
 
 async def main():
     setup_logging("crawler_day7.log", "INFO")
@@ -958,7 +1046,7 @@ async def main():
     await test_performance()
     await test_config_delay()
     await test_stats_real_codes()
-
+    await test_status_code_preserved()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

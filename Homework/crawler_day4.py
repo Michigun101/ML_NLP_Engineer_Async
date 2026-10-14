@@ -291,26 +291,38 @@ class RobotsParser:
         return rules
 
     def can_fetch(self, url: str, user_agent: str = "*") -> bool:
-        """Проверка разрешения"""
+        """Проверка разрешения с учётом trailing slash в паттернах"""
         parsed = urlparse(url)
         domain = parsed.netloc
 
         if domain not in self._cache:
-            return True   # ещё не загрузили — по умолчанию разрешаем
+            return True  
 
         rules = self._cache[domain]
         path = parsed.path or "/"
+
+        def matches(pattern: str, path: str) -> bool:
+            if not pattern:
+                return False
+
+            if pattern.endswith("/") and pattern != "/":
+                base = pattern.rstrip("/")
+                return path == base or path.startswith(base + "/")
+
+            if pattern == "/":
+                return True
+            return path.startswith(pattern)
 
         best_disallow = None
         best_allow = None
 
         for pattern in rules["disallow"]:
-            if path.startswith(pattern):
+            if matches(pattern, path):
                 if best_disallow is None or len(pattern) > len(best_disallow):
                     best_disallow = pattern
 
         for pattern in rules["allow"]:
-            if path.startswith(pattern):
+            if matches(pattern, path):
                 if best_allow is None or len(pattern) > len(best_allow):
                     best_allow = pattern
 
@@ -691,6 +703,7 @@ async def test_rate_limiter_concurrent():
 
     assert min_interval >= 0.15, f"Есть пачка: min interval = {min_interval:.3f}"
     print(" Пачек нет, интервалы соблюдаются")
+
 
 async def main():
     await test_rate_limiter()

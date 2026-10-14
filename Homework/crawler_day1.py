@@ -28,7 +28,7 @@ class AsyncCrawler:
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self):
-        """Создать сессию, если она ещё не создана."""
+        """Создать сессию, если она ещё не создана"""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(
                 total=30,        # таймаут на запрос в сек

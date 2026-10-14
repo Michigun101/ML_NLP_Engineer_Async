@@ -1,6 +1,6 @@
 {
   "crawler_stats": {
-    "processed": 1,
+    "processed": 2,
     "failed": 4,
     "in_queue": 0,
     "blocked_by_robots": 0,
@@ -8,56 +8,67 @@
       "requests_per_second": 2.0,
       "burst": 1,
       "per_domain": true,
-      "keys_tracked": 2,
-      "acquired": 5,
-      "times_waited": 3,
-      "avg_wait": 0.4948
+      "keys_tracked": 1,
+      "acquired": 6,
+      "times_waited": 5,
+      "avg_wait": 0.4989
     },
-    "avg_response_time": 0.109,
-    "requests_per_second": 0.03,
-    "elapsed": 35.34,
+    "avg_response_time": 0.003,
+    "requests_per_second": 0.21,
+    "elapsed": 9.39,
     "robots": {
-      "domains_cached": 2,
+      "domains_cached": 1,
       "loaded": 1
     },
     "blocked_by_circuit": 0,
     "retry": {
-      "attempts": 13,
-      "successes": 1,
+      "attempts": 12,
+      "successes": 2,
       "failures": 4,
-      "retries": 8,
+      "retries": 6,
       "by_error_type": {
-        "NetworkError": 12
+        "PermanentError": 1,
+        "TransientError": 9
       },
-      "permanent_urls": [],
-      "total_retry_time": 25.315513427896338
+      "permanent_urls": [
+        [
+          "http://127.0.0.1:8774/404",
+          "404 Not Found: http://127.0.0.1:8774/404"
+        ]
+      ],
+      "total_retry_time": 5.533818784404741
     },
     "circuit": {
       "domains_with_failures": 1,
       "domains_open": 1,
       "failures": {
-        "httpstat.us": 4
+        "127.0.0.1:8774": 3
       },
       "open_until": {
-        "httpstat.us": 4.53
+        "127.0.0.1:8774": 4.52
       }
     }
   },
   "failed_urls": {
-    "https://httpstat.us/404": "All retries failed: Network: https://httpstat.us/404 — Server disconnected",
-    "https://httpstat.us/500": "All retries failed: Network: https://httpstat.us/500 — Server disconnected",
-    "https://httpstat.us/429": "All retries failed: Network: https://httpstat.us/429 — Server disconnected",
-    "https://httpstat.us/503": "All retries failed: Network: https://httpstat.us/503 — Server disconnected"
-  },
-  "permanent_urls": [],
-  "circuit_stats": {
-    "domains_with_failures": 1,
-    "domains_open": 1,
-    "failures": {
-      "httpstat.us": 4
+    "http://127.0.0.1:8774/404": {
+      "message": "404 Not Found: http://127.0.0.1:8774/404",
+      "error_type": "PermanentError",
+      "status_code": 404
     },
-    "open_until": {
-      "httpstat.us": 4.53
+    "http://127.0.0.1:8774/500": {
+      "message": "500 Server Error: http://127.0.0.1:8774/500",
+      "error_type": "TransientError",
+      "status_code": 500
+    },
+    "http://127.0.0.1:8774/503": {
+      "message": "503 Server Error: http://127.0.0.1:8774/503",
+      "error_type": "TransientError",
+      "status_code": 503
+    },
+    "http://127.0.0.1:8774/429": {
+      "message": "429 Too Many Requests: http://127.0.0.1:8774/429",
+      "error_type": "TransientError",
+      "status_code": 429
     }
   }
 }

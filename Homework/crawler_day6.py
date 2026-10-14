@@ -405,16 +405,14 @@ class StoringCrawler(ReliableCrawler):
 
         result = self.queue.processed[url]
         result["crawled_at"] = datetime.now().isoformat()
-        result["status_code"] = 200
-        result["content_type"] = "text/html"
+        result.setdefault("status_code", 200)   
+        result.setdefault("content_type", "text/html")
 
         try:
             await self._save_with_retry(result)
         except Exception as e:
             logger.error(" Не удалось сохранить %s: %s", url, e)
             self._save_failures = getattr(self, "_save_failures", 0) + 1
-            #  пометить URL как несохранённый (не через queue.failed,
-            #    потому что он уже в processed)
             self._unsaved_urls = getattr(self, "_unsaved_urls", set())
             self._unsaved_urls.add(url)
 

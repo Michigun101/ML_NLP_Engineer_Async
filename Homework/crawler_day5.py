@@ -1,5 +1,3 @@
-"""Day 5: Обработка ошибок и автоматические повторы."""
-
 import asyncio
 import logging
 import random
@@ -350,7 +348,15 @@ class ReliableCrawler(PoliteCrawler):
             self._last_request_by_domain[domain] = time.time()
 
     async def fetch_url(self, url: str) -> str | None:
-        """Загрузка с классификацией ошибок по HTTP-кодам"""
+        """Строковый контракт: возвращает HTML или None."""
+        result = await self.fetch_url_with_status(url)
+        if result is None:
+            return None
+        text, _status = result
+        return text
+    
+    async def fetch_url_with_status(self, url: str) -> tuple[str, int] | None:
+        """Возвращает (HTML, HTTP-код)."""
         await self._ensure_session()
 
         async with self._semaphore:
@@ -385,6 +391,18 @@ class ReliableCrawler(PoliteCrawler):
             except aiohttp.ClientError as e:
                 raise NetworkError(f"Network: {url} — {e}") from e
 
+    async def _fetch_and_parse_with_status(self, url: str) -> dict | None:
+        """Загрузка + парсинг с сохранением HTTP-кода в результате"""
+        result = await self.fetch_url_with_status(url)
+        if result is None:
+            return None
+        text, status = result
+        parsed = await self.parser.parse_html(text, url)
+        if parsed is None:
+            return None
+        parsed["status_code"] = status
+        return parsed
+
     async def _process_one(self, url: str, current_depth: int):
         """Обработка одной страницы"""
         domain = urlparse(url).netloc
@@ -392,7 +410,7 @@ class ReliableCrawler(PoliteCrawler):
         # Проверка circuit breaker
         if self.circuit_breaker.is_open(domain):
             logger.warning(f" Circuit открыт, пропуск: {url}")
-            self.queue.mark_failed(url, "circuit breaker open")
+            self.queue.mark_failed(url, "circuit breaker open", error_type="CircuitOpen")
             self._blocked_by_circuit += 1
             return
 
@@ -406,7 +424,7 @@ class ReliableCrawler(PoliteCrawler):
             else:
                 if not self.robots_parser.can_fetch(url, self.user_agent):
                     logger.info(f" Заблокировано robots.txt: {url}")
-                    self.queue.mark_failed(url, "blocked by robots.txt")
+                    self.queue.mark_failed(url, "blocked by robots.txt", error_type="RobotsBlocked")
                     self._blocked_by_robots += 1
                     return
 
@@ -427,7 +445,7 @@ class ReliableCrawler(PoliteCrawler):
             async with self.semaphores._global_sem:
                 async with self.semaphores.get_domain_semaphore(domain):
                     result = await self.retry_strategy.execute_with_retry(
-                        self.fetch_and_parse,
+                        self._fetch_and_parse_with_status,
                         url,
                         timeout_factor=self.BASE_TIMEOUT   
                     )
@@ -502,86 +520,116 @@ class ReliableCrawler(PoliteCrawler):
             "retry": retry_stats,
             "circuit": circuit_stats,
         }              
-###########################################     
+###########################################  
+
+from aiohttp import web
+
+async def start_mock_server(port: int = 8770, robots: str | None = None):
+    """Локальный мок"""
+    async def handler(request):
+        path = request.path.strip("/") or "200"
+
+        if path == "robots.txt":
+            text = robots if robots is not None else "User-agent: *\n"
+            return web.Response(text=text, content_type="text/plain")
+
+        if path.startswith("delay/"):
+            try:
+                sec = float(path.split("/", 1)[1])
+            except (ValueError, IndexError):
+                sec = 1.0
+            await asyncio.sleep(sec)
+            return web.Response(
+                text='<html><head><title>Delayed</title></head>'
+                     '<body>ok</body></html>',
+                content_type="text/html",
+            )
+
+        if path == "200":
+            return web.Response(
+                text='<html><head><title>OK</title></head>'
+                     '<body><a href="/other">other</a>ok</body></html>',
+                content_type="text/html",
+                status=200,
+            )
+        if path == "404":
+            return web.Response(text="not found", status=404)
+        if path == "500":
+            return web.Response(text="server error", status=500)
+        if path == "503":
+            return web.Response(text="unavailable", status=503)
+        if path == "429":
+            return web.Response(text="too many", status=429)
+        return web.Response(text="ok", content_type="text/html", status=200)
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    return runner
+
 async def demo():
-    """Демонстрация ReliableCrawler."""
     print()
     print("ОБХОД С RETRY И CIRCUIT BREAKER")
 
-    crawler = ReliableCrawler(
-        max_concurrent=5,
-        max_depth=1,
-        requests_per_second=2.0,
-        respect_robots=True,
-        user_agent="ReliableBot/1.0",
-        max_retries=3,
-        backoff_factor=2.0,
-        base_delay=0.5,
-        circuit_threshold=3,
-        circuit_timeout=10.0,
-    )
-
-    urls = [
-        "https://www.python.org",
-        "https://httpstat.us/404",
-        "https://httpstat.us/500",
-        "https://httpstat.us/503",
-        "https://httpstat.us/429",
-    ]
+    runner = await start_mock_server(port=8774, robots="User-agent: *\nDisallow: /private\n")
+    base = "http://127.0.0.1:8774"
 
     try:
-        results = await crawler.crawl(
-            start_urls=urls,
-            max_pages=10,
-            max_depth=0,        
-            same_domain_only=False,
-            progress_every=100,
+        crawler = ReliableCrawler(
+            max_concurrent=5, max_depth=1,
+            requests_per_second=2.0,
+            respect_robots=True,
+            user_agent="ReliableBot/1.0",
+            max_retries=3, backoff_factor=2.0, base_delay=0.5,
+            circuit_threshold=3, circuit_timeout=10.0,
         )
-    finally:
-        await crawler.close()
 
-    print()
-    print(f"РЕЗУЛЬТАТ: обработано {len(results)} страниц")
+        urls = [
+            f"{base}/200",         
+            f"{base}/404",         
+            f"{base}/500",         
+            f"{base}/503",         
+            f"{base}/429",         
+        ]
 
-    for url, data in results.items():
-        print(f"\n {url}")
-        print(f"   Title: {data['title']}")
+        try:
+            results = await crawler.crawl(
+                start_urls=urls, max_pages=10, max_depth=1,
+                same_domain_only=False, progress_every=100,
+            )
+        finally:
+            await crawler.close()
 
-    print()
-    print("СТАТИСТИКА")
+        print(f"\nРЕЗУЛЬТАТ: обработано {len(results)} страниц")
+        for url, data in results.items():
+            print(f"\n {url}")
+            print(f"   Title: {data['title']}")
 
-    s = crawler.stats()
-    print(f"\n Основное:")
-    print(f"   processed:           {s['processed']}")
-    print(f"   failed:              {s['failed']}")
-    print(f"   blocked_by_robots:   {s['blocked_by_robots']}")
-    print(f"   blocked_by_circuit:  {s['blocked_by_circuit']}")
-    print(f"   rps:                 {s['requests_per_second']}")
-
-    print(f"\n Retry:")
-    for key, value in s["retry"].items():
-        if isinstance(value, (int, float)):
+        s = crawler.stats()
+        print(f"\n Основное:")
+        print(f"   processed:           {s['processed']}")
+        print(f"   failed:              {s['failed']}")
+        print(f"   blocked_by_robots:   {s['blocked_by_robots']}")
+        print(f"   blocked_by_circuit:  {s['blocked_by_circuit']}")
+        print(f"\n Retry:")
+        print(f"   by_error_type: {s['retry']['by_error_type']}")
+        print(f"   permanent_urls: {len(s['retry']['permanent_urls'])}")
+        print(f"\n Circuit breaker:")
+        for key, value in s["circuit"].items():
             print(f"   {key}: {value}")
-    print(f"   by_error_type: {s['retry']['by_error_type']}")
-    print(f"   permanent_urls: {len(s['retry']['permanent_urls'])}")
-    for url, err in s["retry"]["permanent_urls"][:5]:
-        print(f"       {url}: {err[:60]}")
 
-    print(f"\n Circuit breaker:")
-    for key, value in s["circuit"].items():
-        print(f"   {key}: {value}")
-
-    report = {
-        "crawler_stats": crawler.stats(),
-        "failed_urls": dict(crawler.queue.failed),
-        "permanent_urls": crawler.retry_strategy.stats["permanent_urls"],
-        "circuit_stats": crawler.circuit_breaker.stats(),
-    }
-
-    with open("error_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-
-    print(f"\n Отчёт сохранён в error_report.json")
+        report = {
+            "crawler_stats": crawler.stats(),
+            "failed_urls": dict(crawler.queue.failed),
+        }
+        with open("error_report.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+        print(f"\n Отчёт сохранён в error_report.json")
+    finally:
+        await runner.cleanup()
     
 
 async def test_per_type_backoff():
@@ -717,116 +765,180 @@ async def test_timeout():
     print(f"   by_error_type: {strategy.stats['by_error_type']}")
 
 async def test_robots_missing():
-    """Отсутствующий robots.txt не должен останавливать обход"""
     print()
     print("ТЕСТ: отсутствующий robots.txt")
 
-    crawler = ReliableCrawler(
-        max_concurrent=3,
-        max_depth=0,
-        respect_robots=True,
-        user_agent="TestBot/1.0",
-    )
-
-    # example.com обычно не имеет robots.txt, либо отдаёт 404
-    try:
-        results = await crawler.crawl(
-            start_urls=["https://example.com"],
-            max_pages=2,
-            max_depth=0,
-            same_domain_only=True,
-            progress_every=100,
+    async def handler(request):
+        if request.path == "/robots.txt":
+            return web.Response(status=404)
+        return web.Response(
+            text='<html><title>OK</title>OK</html>',
+            content_type="text/html", status=200,
         )
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8773)
+    await site.start()
+
+    try:
+        crawler = ReliableCrawler(
+            max_concurrent=3, max_depth=0,
+            respect_robots=True, user_agent="TestBot/1.0",
+            max_retries=1,
+        )
+        try:
+            results = await crawler.crawl(
+                start_urls=["http://127.0.0.1:8773/"],
+                max_pages=2, max_depth=0,
+                same_domain_only=True, progress_every=100,
+            )
+        finally:
+            await crawler.close()
+
+        print(f"  Обработано: {len(results)}")
+        print(f"  Заблокировано robots: {crawler._blocked_by_robots}")
+        print(f"  Упало: {len(crawler.queue.failed)}")
+
+        assert len(results) >= 1
+        print(" Отсутствующий robots.txt не блокирует обход")
     finally:
-        await crawler.close()
-
-    print(f"  Обработано: {len(results)}")
-    print(f"  Заблокировано robots: {crawler._blocked_by_robots}")
-    print(f"  Упало: {len(crawler.queue.failed)}")
-
-    assert len(results) >= 1, "Обход упал из-за отсутствующего robots.txt"
-    print(" Отсутствующий robots.txt не блокирует обход")    
+        await runner.cleanup()    
 
 
 async def test_crawl_delay():
     print()
     print("ТЕСТ: Crawl-delay из robots.txt")
 
-    crawler = ReliableCrawler(
-        max_concurrent=3,
-        max_depth=0,
-        requests_per_second=100.0,   
-        respect_robots=True,
-        user_agent="TestBot/1.0",
-        min_delay=0.0,
-        jitter=0.0,
-    )
+    runner = await start_mock_server(port=8771, robots="User-agent: *\nCrawl-delay: 1\n")
+    base = "http://127.0.0.1:8771"
 
-    original_fetch = crawler.robots_parser.fetch_robots
-    async def fake_fetch(base_url):
-        domain = urlparse(base_url).netloc
-        crawler.robots_parser._cache[domain] = {
-            "domain": domain,
-            "disallow": [],
-            "allow": [],
-            "crawl_delay": 1.0,   
-            "loaded": True,
-        }
-        return crawler.robots_parser._cache[domain]
-
-    crawler.robots_parser.fetch_robots = fake_fetch
-
-    urls = [
-        "https://example.com/a",
-        "https://example.com/b",
-        "https://example.com/c",
-    ]
-
-    start = time.time()
     try:
-        await crawler.crawl(
-            start_urls=urls, max_pages=3, max_depth=0,
-            same_domain_only=True, progress_every=100,
+        crawler = ReliableCrawler(
+            max_concurrent=3, max_depth=0,
+            requests_per_second=100.0,
+            respect_robots=True, user_agent="TestBot/1.0",
+            min_delay=0.0, jitter=0.0,
         )
-    finally:
-        await crawler.close()
-    elapsed = time.time() - start
+        urls = [f"{base}/200", f"{base}/200?i=2", f"{base}/200?i=3"]
 
-    print(f"  3 URL, Crawl-delay=1, rate=100 RPS")
-    print(f"  Время: {elapsed:.2f} сек")
+        start = time.time()
+        try:
+            await crawler.crawl(
+                start_urls=urls, max_pages=3, max_depth=0,
+                same_domain_only=True, progress_every=100,
+            )
+        finally:
+            await crawler.close()
+        elapsed = time.time() - start
+
+        print(f"  3 URL, Crawl-delay=1, rate=100 RPS")
+        print(f"  Время: {elapsed:.2f} сек")
+
+        assert elapsed >= 1.9, f"Crawl-delay не соблюдается: {elapsed:.2f}"
+        print(" Crawl-delay работает")
+    finally:
+        await runner.cleanup()
 
 
 async def test_min_delay():
     print()
     print("ТЕСТ: min_delay")
 
-    crawler = ReliableCrawler(
-        max_concurrent=1,
-        max_depth=0,
-        requests_per_second=100.0,
-        respect_robots=False,      # robots не мешает
-        min_delay=0.5,
-        jitter=0.0,
-    )
+    runner = await start_mock_server(port=8772)
+    base = "http://127.0.0.1:8772"
 
-    urls = [f"https://example.com/{i}" for i in range(3)]
-
-    start = time.time()
     try:
-        await crawler.crawl(
-            start_urls=urls, max_pages=3, max_depth=0,
-            same_domain_only=True, progress_every=100,
+        crawler = ReliableCrawler(
+            max_concurrent=1, max_depth=0,
+            requests_per_second=100.0,
+            respect_robots=False,
+            min_delay=0.5, jitter=0.0,
         )
+        urls = [f"{base}/200?i={i}" for i in range(3)]
+
+        start = time.time()
+        try:
+            await crawler.crawl(
+                start_urls=urls, max_pages=3, max_depth=0,
+                same_domain_only=True, progress_every=100,
+            )
+        finally:
+            await crawler.close()
+        elapsed = time.time() - start
+
+        print(f"  3 URL, min_delay=0.5")
+        print(f"  Время: {elapsed:.2f} сек")
+
+        assert elapsed >= 1.4, f"min_delay не работает: {elapsed:.2f}"
+        print(" min_delay работает")
+    finally:
+        await runner.cleanup()
+
+async def test_fetch_url_contract():
+    """fetch_url возвращает строку, не tuple."""
+    crawler = ReliableCrawler(respect_robots=False, max_retries=1)
+    try:
+        text = await crawler.fetch_url("https://example.com")
     finally:
         await crawler.close()
-    elapsed = time.time() - start
+    assert isinstance(text, str), f"fetch_url вернул {type(text).__name__}"
+    assert len(text) > 0
+    print(" fetch_url возвращает строку")
 
-    print(f"  3 URL, min_delay=0.5")
-    print(f"  Время: {elapsed:.2f} сек")
+async def test_error_types_are_typed():
+    """Circuit и robots дают правильные error_type, а не UnknownError."""
+    print()
+    print("ТЕСТ: типизированные error_type для circuit и robots")
 
-    assert elapsed >= 1.3, f"min_delay не работает: {elapsed:.2f}"
-    print(" min_delay работает")    
+    from aiohttp import web
+    async def handler(request):
+        if request.path == "/robots.txt":
+            return web.Response(
+                text="User-agent: *\nDisallow: /private\n",
+                content_type="text/plain",
+            )
+        return web.Response(text="<html><title>OK</title>OK</html>",
+                            content_type="text/html")
 
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8767)
+    await site.start()
+
+    try:
+        crawler = ReliableCrawler(
+            max_concurrent=3, max_depth=0,
+            respect_robots=True, user_agent="TestBot/1.0",
+            max_retries=1,
+        )
+        try:
+            results = await crawler.crawl(
+                start_urls=[
+                    "http://127.0.0.1:8767/private/secret",
+                    "http://127.0.0.1:8767/public",
+                ],
+                max_pages=5, max_depth=0, progress_every=100,
+            )
+        finally:
+            await crawler.close()
+
+        print(f"  processed: {list(results.keys())}")
+        for url, info in crawler.queue.failed.items():
+            print(f"  failed {url}: error_type={info.get('error_type')!r}")
+
+        types = {info.get("error_type") for info in crawler.queue.failed.values()}
+        assert "RobotsBlocked" in types, f"Нет RobotsBlocked в {types}"
+        assert "UnknownError" not in types, f"UnknownError в {types}"
+        print(" Типизированные error_type работают")
+    finally:
+        await runner.cleanup()
+
+       
 
 async def main():
     await test_retry_strategy()
@@ -836,6 +948,8 @@ async def main():
     await test_robots_missing()
     await test_crawl_delay()
     await test_min_delay()
+    await test_fetch_url_contract()
+    await test_error_types_are_typed()
     await demo()
 
 

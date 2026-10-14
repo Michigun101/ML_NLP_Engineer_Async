@@ -99,10 +99,11 @@ class CrawlerQueue:
     def mark_failed(self, url: str, error, status_code: int | None = None,
                 error_type: str | None = None):
         url = normalize_url(url)
+
         if isinstance(error, Exception):
             info = {
                 "message": str(error),
-                "error_type": error_type or type(error).__name__,
+                "error_type": error_type or getattr(error, "error_type", type(error).__name__),
                 "status_code": status_code if status_code is not None else getattr(error, "status_code", None),
             }
         else:
@@ -111,6 +112,7 @@ class CrawlerQueue:
                 "error_type": error_type or "UnknownError",
                 "status_code": status_code,
             }
+
         self.failed[url] = info
         self._queued.discard(url)
 
