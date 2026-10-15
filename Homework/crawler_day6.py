@@ -214,6 +214,9 @@ class SQLiteStorage(DataStorage):
         self._errors = 0
         self._duplicates = 0
 
+        self._lock = asyncio.Lock()          # для _flush
+        self._init_lock = asyncio.Lock()
+
         self._insert_sql = """
             INSERT OR IGNORE INTO pages
             (url, title, text, links, metadata, crawled_at, status_code, content_type)
@@ -249,14 +252,21 @@ class SQLiteStorage(DataStorage):
         logger.debug("SQLite схема инициализирована: %s", self.path)
 
     async def _ensure_open(self):
-        """Открыть соединение и создать схему."""
-        if self._conn is None or not self._conn._running:
+        if self._conn is not None and self._conn._running:
+            return
+
+        async with self._init_lock:
+            # повторная проверка внутри lock — другой воркер мог уже создать
+            if self._conn is not None and self._conn._running:
+                return
+
             if self._conn is not None:
                 try:
                     await self._conn.close()
                 except Exception:
                     pass
                 self._conn = None
+
             await self.init_db()
 
     def _prepare_row(self, data: dict) -> tuple:
@@ -277,60 +287,50 @@ class SQLiteStorage(DataStorage):
         if not isinstance(data, dict):
             raise ValueError(f"data должен быть dict, получено {type(data).__name__}")
 
-        await self._ensure_open()
-
-        self._buffer.append(self._prepare_row(data))
-
-        if len(self._buffer) >= self.batch_size:
-            await self._flush()
+        async with self._lock:
+            await self._ensure_open()
+            self._buffer.append(self._prepare_row(data))
+            if len(self._buffer) >= self.batch_size:
+                await self._flush_unlocked()
 
     async def _flush(self):
+        """Публичный flush — захватывает lock"""
+        async with self._lock:
+            await self._flush_unlocked()
+
+    async def _flush_unlocked(self):
+        """Внутренний flush — предполагает, что lock уже захвачен"""
         if not self._buffer:
             return
 
-        async with self._lock:
-            if not self._buffer:
-                return
+        batch = list(self._buffer)
+        try:
+            cursor = await self._conn.executemany(self._insert_sql, batch)
+            await self._conn.commit()
+        except Exception as e:
+            self._errors += 1
+            logger.error(" Не удалось записать batch из %d записей: %s", len(batch), e)
+            raise
 
-            batch = list(self._buffer)
+        inserted = cursor.rowcount
+        self._duplicates += len(batch) - inserted
+        self._saved += inserted
 
+        for row in batch:
             try:
-                cursor = await self._conn.executemany(self._insert_sql, batch)
-                await self._conn.commit()
-            except Exception as e:
-                self._errors += 1
-                logger.error(
-                    " Не удалось записать batch из %d записей: %s",
-                    len(batch), e,
-                )
-                raise
+                self._buffer.remove(row)
+            except ValueError:
+                pass
 
-            #  подсчёт дублей по rowcount
-            inserted = cursor.rowcount
-            self._duplicates += len(batch) - inserted
-            self._saved += inserted
-
-            for row in batch:
-                try:
-                    self._buffer.remove(row)
-                except ValueError:
-                    pass
-
-            logger.debug(
-                " Записано %d из %d (дублей: %d)",
-                inserted, len(batch), len(batch) - inserted,
-            )
-
-    async def close(self) -> None:
-        """Финальный flush и закрытие"""
+    async def close(self):
         if self._conn is not None:
-            await self._flush()
-            await self._conn.close()
-            self._conn = None
-            logger.info(
-                "SQLite закрыт (%d записей, %d дублей)",
-                self._saved, self._duplicates,
-            )
+            try:
+                await self._flush()
+            finally:
+                async with self._init_lock:
+                    if self._conn is not None:
+                        await self._conn.close()
+                        self._conn = None
 
     async def read_all(self, limit: int = 100) -> list[dict]:
         """Прочитать все записи"""
@@ -716,6 +716,43 @@ async def test_storing_crawler_save_failure():
     assert storage.save_calls >= 1, "Сохранение не вызывалось"
     print(" Ошибка storage не валит краулер, страница обработана")
 
+async def test_sqlite_concurrent_save():
+    print()
+    print("ТЕСТ: параллельное сохранение в SQLite")
+
+    if os.path.exists("test_concurrent.db"):
+        os.remove("test_concurrent.db")
+
+    storage = SQLiteStorage("test_concurrent.db", batch_size=5)
+
+    # 50 записей параллельно
+    await asyncio.gather(*[
+        storage.save({
+            "url": f"https://example.com/{i}",
+            "title": f"Page {i}",
+            "crawled_at": datetime.now().isoformat(),
+            "status_code": 200,
+            "content_type": "text/html",
+        })
+        for i in range(50)
+    ])
+
+    await storage.close()
+
+    # Проверяем, что все 50 сохранены, соединений не осталось висеть
+    stats = storage.stats()
+    print(f"  Stats: {stats}")
+    assert stats["saved"] == 50, f"Сохранено {stats['saved']}, ожидалось 50"
+    assert stats["errors"] == 0, f"Ошибок: {stats['errors']}"
+
+    # Читаем обратно
+    storage2 = SQLiteStorage("test_concurrent.db")
+    records = await storage2.read_all(limit=100)
+    await storage2.close()
+    print(f"  Прочитано: {len(records)}")
+    assert len(records) == 50, f"Прочитано {len(records)}, ожидалось 50"
+
+    print(" Параллельное сохранение в SQLite работает")
 
 async def main():
     await test_json_storage()
@@ -724,6 +761,7 @@ async def main():
     await test_save_error()      
     await test_sqlite_flush_retains_on_error()      
     await test_storing_crawler_save_failure()      
+    await test_sqlite_concurrent_save()      
     await demo()
 
 

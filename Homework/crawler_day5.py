@@ -392,7 +392,23 @@ class ReliableCrawler(PoliteCrawler):
                 raise NetworkError(f"Network: {url} — {e}") from e
 
     async def _fetch_and_parse_with_status(self, url: str) -> dict | None:
-        """Загрузка + парсинг с сохранением HTTP-кода в результате"""
+        """Одна HTTP-попытка с соблюдением вежливости"""
+        domain = urlparse(url).netloc
+
+        #  Rate limit перед каждой попыткой
+        await self.rate_limiter.acquire(domain)
+
+        #  Crawl-delay перед каждой попыткой
+        if self.respect_robots:
+            robots_delay = self.robots_parser.get_crawl_delay(url)
+            if robots_delay > 0:
+                await self._wait_crawl_delay(domain, robots_delay)
+
+        #  min_delay + jitter перед каждой попыткой
+        if self.min_delay > 0:
+            extra = self.min_delay + random.uniform(0, self.jitter)
+            await asyncio.sleep(extra)
+
         result = await self.fetch_url_with_status(url)
         if result is None:
             return None
@@ -428,15 +444,6 @@ class ReliableCrawler(PoliteCrawler):
                     self._blocked_by_robots += 1
                     return
 
-                robots_delay = self.robots_parser.get_crawl_delay(url)
-                if robots_delay > 0:
-                    await self._wait_crawl_delay(domain, robots_delay)
-
-        await self.rate_limiter.acquire(domain)
-
-        if self.min_delay > 0:
-            extra = self.min_delay + random.uniform(0, self.jitter)
-            await asyncio.sleep(extra)
 
         # Загрузка с retry
         start = time.time()
@@ -938,6 +945,54 @@ async def test_error_types_are_typed():
     finally:
         await runner.cleanup()
 
+async def test_rate_limit_on_retries():
+    print()
+    print("ТЕСТ: rate limit применяется к каждой попытке retry")
+
+    import time as _time
+    request_times = []
+
+    async def handler(request):
+        request_times.append(_time.time())
+        return web.Response(status=500, text="error")   # всегда падает → retry
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8775)
+    await site.start()
+
+    try:
+        crawler = ReliableCrawler(
+            max_concurrent=1, max_depth=0,
+            requests_per_second=2.0,   # 0.5 сек между запросами
+            respect_robots=False,
+            max_retries=3, backoff_factor=1.0, base_delay=0.1,
+            min_delay=0.0, jitter=0.0,
+        )
+        try:
+            await crawler.crawl(
+                start_urls=["http://127.0.0.1:8775/fail"],
+                max_pages=1, max_depth=0,
+                same_domain_only=True, progress_every=100,
+            )
+        finally:
+            await crawler.close()
+
+        print(f"  Всего запросов: {len(request_times)}")
+        intervals = [
+            request_times[i+1] - request_times[i]
+            for i in range(len(request_times) - 1)
+        ]
+        print(f"  Интервалы: {[round(x, 2) for x in intervals]}")
+
+        assert len(request_times) == 3, f"Ожидалось 3 запроса, получено {len(request_times)}"
+        assert all(x >= 0.4 for x in intervals), \
+            f"Rate limit не соблюдается: {intervals}"
+        print(" Rate limit применяется к каждой попытке retry")
+    finally:
+        await runner.cleanup()
        
 
 async def main():
@@ -950,6 +1005,7 @@ async def main():
     await test_min_delay()
     await test_fetch_url_contract()
     await test_error_types_are_typed()
+    await test_rate_limit_on_retries()
     await demo()
 
 

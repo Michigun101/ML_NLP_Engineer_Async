@@ -9,13 +9,13 @@
       "burst": 1,
       "per_domain": true,
       "keys_tracked": 1,
-      "acquired": 6,
-      "times_waited": 5,
-      "avg_wait": 0.4989
+      "acquired": 12,
+      "times_waited": 11,
+      "avg_wait": 0.4447
     },
-    "avg_response_time": 0.003,
-    "requests_per_second": 0.21,
-    "elapsed": 9.39,
+    "avg_response_time": 1.268,
+    "requests_per_second": 0.18,
+    "elapsed": 11.14,
     "robots": {
       "domains_cached": 1,
       "loaded": 1
@@ -36,7 +36,7 @@
           "404 Not Found: http://127.0.0.1:8774/404"
         ]
       ],
-      "total_retry_time": 5.533818784404741
+      "total_retry_time": 5.888718242889461
     },
     "circuit": {
       "domains_with_failures": 1,
@@ -45,7 +45,7 @@
         "127.0.0.1:8774": 3
       },
       "open_until": {
-        "127.0.0.1:8774": 4.52
+        "127.0.0.1:8774": 4.45
       }
     }
   },
